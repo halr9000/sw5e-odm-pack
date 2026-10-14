@@ -389,6 +389,168 @@ def build_archetypes():
     return rows
 
 
+_ITEM_KEY_LABELS = {
+    "two": "two-handed", "luminous": "luminous", "lgt": "light", "fin": "finesse",
+    "strRq": "strength", "dexRq": "dexterity", "hidden": "hidden", "rel": "reload",
+    "ver": "versatile", "rch": "reach", "auto": "automatic", "hvy": "heavy",
+    "fixed": "fixed", "special": "special", "silentWeapon": "silent",
+    "silentEquipment": "silent", "powerCell": "power cell", "mighty": "mighty",
+    "disarming": "disarming", "ret": "retractable", "interlockingWeapon": "interlocking",
+}
+_ITEM_CATEGORIES = {
+    "simple-blasters": "Simple Blasters", "martial-blasters": "Martial Blasters",
+    "exotic-blasters": "Exotic Blasters",
+    "simple-lightweapons": "Simple Light Weapons",
+    "martial-lightweapons": "Martial Light Weapons",
+    "exotic-lightweapons": "Exotic Light Weapons",
+    "simple-vibroweapons": "Simple Vibroweapons",
+    "martial-vibroweapons": "Martial Vibroweapons",
+    "exotic-vibroweapons": "Exotic Vibroweapons",
+    "natural-weapons": "Natural Weapons",
+    "light": "Light Armor", "medium": "Medium Armor", "heavy": "Heavy Armor",
+    "shield": "Shields",
+    "artisans-implements": "Artisan's Implements", "gaming-sets": "Gaming Sets",
+    "musical-instruments": "Musical Instruments",
+    "specialists-kits": "Specialists Kits",
+    "adventuring-gear": "Adventuring Gear", "weapons": "Weapons",
+    "armor": "Armor", "tools": "Tools", "consumables": "Consumables",
+    "cybernetic-augmentations": "Cybernetic Augmentations",
+    "droid-customizations": "Droid Customizations",
+    "focus-generators": "Focus Generators", "item-modifications": "Item Modifications",
+}
+
+
+def _item_category(folder: str) -> str:
+    return _ITEM_CATEGORIES.get(folder) or folder.replace("-", " ").title()
+
+
+def _item_props(d: dict) -> list:
+    """Readable property strings for a weapon/armor item: system.properties
+    keys (dnd5e short codes) labeled via _ITEM_KEY_LABELS, values taken from
+    flags.sw5e.properties when present (e.g. rel: 16 -> 'reload 16')."""
+    sys_ = d.get("system") or {}
+    flag_props = ((d.get("flags") or {}).get("sw5e") or {}).get("properties") or {}
+    out = []
+    for key in (sys_.get("properties") or []):
+        val = flag_props.get(key)
+        label = _ITEM_KEY_LABELS.get(key, key)
+        if isinstance(val, (int, float, str)) and val not in (True, None, ""):
+            out.append(f"{label} {val}")
+        else:
+            out.append(label)
+    return out
+
+
+def _item_cost(sys_: dict) -> str:
+    price = sys_.get("price") or {}
+    if price.get("value") in (None, ""):
+        return ""
+    denom = price.get("denomination") or "gc"
+    return f"{price['value']} {denom}"
+
+
+def _item_weight(sys_: dict) -> float:
+    w = (sys_.get("weight") or {}).get("value")
+    try:
+        return float(w)
+    except (TypeError, ValueError):
+        return 0.0  # ODM convention: 0 = the source did not say
+
+
+def _item_doc_tag(doc):
+    return {
+        "document__slug": doc[0], "document__title": doc[1],
+        "document__license_url": "https://sw5e.com/attributing",
+        "document__url": doc[4],
+    }
+
+
+def build_items():
+    """items(slug, name, document_slug, kind, rarity, cost, category, weight,
+    data_json)
+
+    Sources: equipment/ (weapons, armor, adventuring-gear, tools) and
+    enhanceditems/ (all kinds of augmented gear -> magic_item); the
+    third-party codex item packs are excluded (user decision: only monsters
+    were mandated full third-party coverage). kind mapping: type weapon ->
+    weapon; equipment/armor folder -> armor; everything else under
+    equipment/ -> gear; enhanceditems/ -> magic_item. category comes from
+    the parent folder name. data_json shape per kind follows the open5e
+    pack rows (weapon: damage_dice/damage_type/properties; armor:
+    base_ac/plus_dex_mod/plus_max/ac_string/strength_requirement/
+    stealth_disadvantage; gear/magic_item: desc + rarity/attunement)."""
+    base = os.path.join(SRC_ROOT)
+    files = [f for f in glob.glob(os.path.join(base, "equipment", "**", "*.yml"),
+                                  recursive=True)
+             + glob.glob(os.path.join(base, "enhanceditems", "**", "*.yml"),
+                         recursive=True)
+             if not os.path.basename(f).startswith("_")]
+    # disambiguate colliding filenames (33, e.g. pack contents vs utilities)
+    by_base = {}
+    for f in files:
+        by_base.setdefault(os.path.basename(f)[:-4], []).append(f)
+    rows = []
+    for f in sorted(files):
+        d = _load(f)
+        sys_ = d.get("system") or {}
+        base_name = os.path.basename(f)[:-4]
+        eq_root = os.path.join(base, "equipment")
+        pack = "equipment" if f.startswith(eq_root) else "enhanceditems"
+        rel_dir = os.path.relpath(os.path.dirname(f), os.path.join(base, pack))
+        parent = os.path.basename(os.path.dirname(f))
+        in_armor_tree = rel_dir == "armor" or rel_dir.startswith("armor" + os.sep)
+        if len(by_base.get(base_name, [])) > 1:
+            slug = f"{parent}-{base_name}"
+        else:
+            slug = base_name
+        name = d.get("name") or slug.replace("-", " ").title()
+        desc = html_to_md((sys_.get("description") or {}).get("value", ""))
+        kind = "magic_item" if pack == "enhanceditems" else (
+            "weapon" if d.get("type") == "weapon"
+            else "armor" if in_armor_tree
+            else "gear")
+        cost = _item_cost(sys_)
+        weight = _item_weight(sys_)
+        rarity = sys_.get("rarity") or ""
+        category = _item_category(parent)
+        data = {"name": name, "slug": slug, "category": category, "desc": desc,
+                "cost": cost, "weight": weight, **_item_doc_tag(doc_meta(sys_.get("source")))}
+        if kind == "weapon":
+            parts = ((sys_.get("damage") or {}).get("parts") or [])
+            dice = str(parts[0][0]).replace(" + @mod", "") if parts else ""
+            dtype = str(parts[0][1]) if parts else ""
+            data.update({"damage_dice": dice, "damage_type": dtype,
+                         "properties": _item_props(d)})
+        elif kind == "armor":
+            armor = sys_.get("armor") or {}
+            dex = armor.get("dex")
+            value = armor.get("value")
+            data.update({
+                "base_ac": value, "plus_dex_mod": dex != 0,
+                "plus_flat_mod": 0, "plus_max": dex or 0,
+                "ac_string": (f"{value} + Dex modifier (max {dex})" if dex
+                              else f"{value} + Dex modifier" if dex is None
+                              else str(value)),
+                "strength_requirement": None,
+                "stealth_disadvantage": "stealthDisadvantage"
+                in (sys_.get("properties") or []),
+                "properties": _item_props(d),
+            })
+            for key in (sys_.get("properties") or []):
+                if key == "strength":
+                    data["strength_requirement"] = \
+                        (((d.get("flags") or {}).get("sw5e") or {})
+                         .get("properties") or {}).get("strength")
+        elif kind == "magic_item":
+            data.update({
+                "rarity": rarity,
+                "requires_attunement": sys_.get("attunement") == "required",
+            })
+        rows.append((slug, name, data["document__slug"], kind, rarity, cost,
+                     category, weight, data))
+    return rows
+
+
 def main():
     races, race_rows = build_races()
     used_docs = {r["document_slug"] for r in races}
@@ -398,12 +560,14 @@ def main():
     spell_rows = build_spells()
     class_rows = build_classes()
     arch_rows = build_archetypes()
+    item_rows = build_items()
     used_docs.update(row[2] for row in cond_rows)
     used_docs.update(row[2] for row in feat_rows)
     used_docs.update(row[2] for row in bg_rows)
     used_docs.update(row[2] for row in spell_rows)
     used_docs.update(row[2] for row in class_rows)
     used_docs.update(row[2] for row in arch_rows)
+    used_docs.update(row[2] for row in item_rows)
     doc_specs = {spec[0]: spec for spec in
                  sorted(set(DOCS.values()) | {DOC_DEFAULT}, key=lambda t: t[0])}
     docs = documents_rows_from(used_docs, doc_specs)
@@ -416,10 +580,12 @@ def main():
         "spells": spell_rows,
         "classes": class_rows,
         "archetypes": arch_rows,
+        "items": item_rows,
     })
     print(f"races: {len(race_rows)} | conditions: {len(cond_rows)} | feats: {len(feat_rows)}"
           f" | backgrounds: {len(bg_rows)} | spells: {len(spell_rows)}"
-          f" | classes: {len(class_rows)} | archetypes: {len(arch_rows)}")
+          f" | classes: {len(class_rows)} | archetypes: {len(arch_rows)}"
+          f" | items: {len(item_rows)}")
     print("documents:", sorted(used_docs))
 
 
