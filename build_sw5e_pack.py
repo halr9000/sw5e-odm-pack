@@ -330,6 +330,65 @@ def build_spells():
     return rows
 
 
+def build_classes():
+    """classes(slug, name, document_slug, hit_die, data_json)
+    data_json: {name, slug, desc, hit_die, document__*} — picker-level rows
+    only (user decision): no feature tables, no proficiency/table text."""
+    rows = []
+    for f in sorted(glob.glob(os.path.join(SRC_ROOT, "character-classes",
+                                           "*", "*.yml"))):
+        slug = os.path.basename(f)[:-4]
+        if os.path.basename(os.path.dirname(f)) != slug:
+            continue  # only <slug>/<slug>.yml is the class file itself
+        d = _load(f)
+        sys_ = d.get("system") or {}
+        hd = ((sys_.get("hd") or {}).get("denomination") or "")
+        hit_die = int(hd[1:]) if hd.startswith("d") and hd[1:].isdigit() else 0
+        doc = doc_meta(sys_.get("source"))
+        data = {
+            "name": d.get("name") or slug.title(), "slug": slug,
+            "desc": html_to_md((sys_.get("description") or {}).get("value", "")),
+            "hit_die": hit_die,
+            "document__slug": doc[0],
+            "document__title": doc[1],
+            "document__license_url": "https://sw5e.com/attributing",
+            "document__url": doc[4],
+        }
+        rows.append((slug, data["name"], doc[0], hit_die, data))
+    return rows
+
+
+def build_archetypes():
+    """archetypes(slug, name, document_slug, class_slug, data_json)
+    data_json: {name, slug, subclass_class_name, desc, document__*}
+    <class>/archetypes/*.yml type: subclass files; class_slug = owning class
+    folder. All 137 archetype identifiers are unique across classes, so the
+    identifier/filename stands as the slug directly."""
+    rows = []
+    classes = {r[0]: r[1] for r in build_classes()}
+    for class_slug in sorted(classes):
+        for f in sorted(glob.glob(os.path.join(SRC_ROOT, "character-classes",
+                                               class_slug, "archetypes", "*.yml"))):
+            d = _load(f)
+            if (d.get("type") or "") != "subclass":
+                continue  # _folder.yml and any non-subclass shape
+            sys_ = d.get("system") or {}
+            slug = sys_.get("identifier") or os.path.basename(f)[:-4]
+            name = d.get("name") or slug.replace("-", " ").title()
+            doc = doc_meta(sys_.get("source"))
+            data = {
+                "name": name, "slug": slug,
+                "subclass_class_name": classes[class_slug],
+                "desc": html_to_md((sys_.get("description") or {}).get("value", "")),
+                "document__slug": doc[0],
+                "document__title": doc[1],
+                "document__license_url": "https://sw5e.com/attributing",
+                "document__url": doc[4],
+            }
+            rows.append((slug, name, doc[0], class_slug, data))
+    return rows
+
+
 def main():
     races, race_rows = build_races()
     used_docs = {r["document_slug"] for r in races}
@@ -337,10 +396,14 @@ def main():
     feat_rows = build_feats()
     bg_rows = build_backgrounds()
     spell_rows = build_spells()
+    class_rows = build_classes()
+    arch_rows = build_archetypes()
     used_docs.update(row[2] for row in cond_rows)
     used_docs.update(row[2] for row in feat_rows)
     used_docs.update(row[2] for row in bg_rows)
     used_docs.update(row[2] for row in spell_rows)
+    used_docs.update(row[2] for row in class_rows)
+    used_docs.update(row[2] for row in arch_rows)
     doc_specs = {spec[0]: spec for spec in
                  sorted(set(DOCS.values()) | {DOC_DEFAULT}, key=lambda t: t[0])}
     docs = documents_rows_from(used_docs, doc_specs)
@@ -351,9 +414,12 @@ def main():
         "feats": feat_rows,
         "backgrounds": bg_rows,
         "spells": spell_rows,
+        "classes": class_rows,
+        "archetypes": arch_rows,
     })
     print(f"races: {len(race_rows)} | conditions: {len(cond_rows)} | feats: {len(feat_rows)}"
-          f" | backgrounds: {len(bg_rows)} | spells: {len(spell_rows)}")
+          f" | backgrounds: {len(bg_rows)} | spells: {len(spell_rows)}"
+          f" | classes: {len(class_rows)} | archetypes: {len(arch_rows)}")
     print("documents:", sorted(used_docs))
 
 
