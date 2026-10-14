@@ -197,15 +197,150 @@ def build_backgrounds():
     return rows
 
 
+_FORCE_CLASSES = "Consular, Guardian, Sentinel"
+_TECH_CLASSES = "Engineer, Scout, Scholar"
+_ACT_WORD = {"action": "action", "bonus": "bonus action", "reaction": "reaction"}
+_LEVEL_WORD = {0: "Cantrip", 1: "1st", 2: "2nd", 3: "3rd"}
+_current_slug = ""  # set by build_spells before each _range_text call
+
+
+def _spell_level_word(level: int) -> str:
+    return f"{_LEVEL_WORD.get(level, str(level) + 'th')}-level"
+
+
+def _casting_time(activation: dict) -> str:
+    """Foundry activation {type, cost} -> open5e casting_time string."""
+    a = activation or {}
+    typ = a.get("type") or "none"
+    cost = a.get("cost") if isinstance(a.get("cost"), (int, float)) else 1
+    if typ in _ACT_WORD:
+        return f"1 {_ACT_WORD[typ]}"
+    if typ in ("minute", "hour", "day"):
+        return f"{cost} {typ}{'' if cost == 1 else 's'}"
+    return "special"  # covers 'none' (two weapon-integrated powers) and anything new
+
+
+def _duration_text(duration: dict, concentration: bool) -> str:
+    d = duration or {}
+    units = d.get("units") or ""
+    val = d.get("value") or ""
+    if units == "inst":
+        return "Instantaneous"
+    if units in ("minute", "hour", "day", "round", "turn"):
+        try:
+            n = int(val)
+        except (TypeError, ValueError):
+            n = 0
+        word = f"{val} {units}{'' if n == 1 else 's'}"
+        return f"Up to {word}" if concentration else word
+    return ""
+
+
+def _range_text(rng: dict) -> tuple:
+    """(open5e range string, target_range_sort) — sort key as open5e computes
+    it: self=0, touch=1, N feet=N, miles*5280, sight=9999, special=99990,
+    unlimited=99999."""
+    r = rng or {}
+    units = r.get("units") or ""
+    val = r.get("value")
+    if units == "ft":
+        n = int(val) if isinstance(val, (int, float)) else 0
+        return f"{n} feet", n
+    if units == "mi":
+        n = int(val) if isinstance(val, (int, float)) else 1
+        return f"{n} mile{'' if n == 1 else 's'}", n * 5280
+    if units == "self":
+        return "Self", 0
+    if units == "touch":
+        return "Touch", 1
+    if not units:
+        # 8 tech powers set no range: 'sending' is truly unlimited, the
+        # weapon-attack riders act on the weapon's own range -> Self.
+        if os.path.basename(_current_slug) == "sending":
+            return "Unlimited", 99999
+        return "Self", 0
+    return "Special", 99990
+
+
+def build_spells():
+    """spells(slug, name, document_slug, level, school, classes_csv, ritual,
+    concentration, aliases_csv, data_json)
+
+    Force powers (force-powers/*/) and tech powers (tech-powers/*/) — the
+    SW5e spell-equivalents; maneuvers are deliberately excluded (user
+    decision, they are feat/action-shaped). Folder name gives the level
+    ('1st-level'..'9th-level', 'at-will' = 0). school is the user-decided
+    verbatim family string 'Force'/'Tech' (the source's uni/drk/lgt/tec
+    sub-school is kept in data_json.sw5e_school). classes_csv is the family
+    default list — no power YAML carries class data."""
+    families = {
+        "force-powers": ("Force", _FORCE_CLASSES, ["consular", "guardian", "sentinel"]),
+        "tech-powers": ("Tech", _TECH_CLASSES, ["engineer", "scout", "scholar"]),
+    }
+    global _current_slug
+    rows = []
+    for family, (school, dnd_class, spell_lists) in families.items():
+        base = os.path.join(SRC_ROOT, "powers-maneuvers", family)
+        for folder in sorted(os.listdir(base)):
+            dirpath = os.path.join(base, folder)
+            if folder.startswith("_") or not os.path.isdir(dirpath):
+                continue
+            if folder == "at-will":
+                level = 0
+            else:
+                level = int(re.match(r"(\d+)", folder).group(1))
+            for f in sorted(glob.glob(os.path.join(dirpath, "*.yml"))):
+                d = _load(f)
+                if (d.get("type") or "") != "spell":
+                    continue  # each level dir also carries an _folder.yml Item
+                sys_ = d.get("system") or {}
+                slug = os.path.basename(f)[:-4]
+                _current_slug = slug
+                name = d.get("name") or slug.replace("-", " ").title()
+                desc = html_to_md((sys_.get("description", {}) or {}).get("value", ""))
+                concentration = 1 if "concentration" in (sys_.get("properties") or []) else 0
+                rng_str, sort = _range_text(sys_.get("range"))
+                doc = doc_meta(sys_.get("source"))
+                data = {
+                    "slug": slug, "name": name, "desc": desc,
+                    "higher_level": "", "page": "",
+                    "range": rng_str, "target_range_sort": sort,
+                    "components": "",
+                    "requires_verbal_components": False,
+                    "requires_somatic_components": False,
+                    "requires_material_components": False,
+                    "material": "",
+                    "can_be_cast_as_ritual": False, "ritual": "no",
+                    "duration": _duration_text(sys_.get("duration"), bool(concentration)),
+                    "concentration": "yes" if concentration else "no",
+                    "requires_concentration": bool(concentration),
+                    "casting_time": _casting_time(sys_.get("activation")),
+                    "level": _spell_level_word(level), "level_int": level,
+                    "spell_level": level, "school": school,
+                    "sw5e_school": sys_.get("school") or "",
+                    "dnd_class": dnd_class, "spell_lists": spell_lists,
+                    "archetype": "", "circles": "",
+                    "document__slug": doc[0],
+                    "document__title": doc[1],
+                    "document__license_url": "https://sw5e.com/attributing",
+                    "document__url": doc[4],
+                }
+                rows.append((slug, name, doc[0], level, school, dnd_class,
+                             0, concentration, "", data))
+    return rows
+
+
 def main():
     races, race_rows = build_races()
     used_docs = {r["document_slug"] for r in races}
     cond_rows = build_conditions()
     feat_rows = build_feats()
     bg_rows = build_backgrounds()
+    spell_rows = build_spells()
     used_docs.update(row[2] for row in cond_rows)
     used_docs.update(row[2] for row in feat_rows)
     used_docs.update(row[2] for row in bg_rows)
+    used_docs.update(row[2] for row in spell_rows)
     doc_specs = {spec[0]: spec for spec in
                  sorted(set(DOCS.values()) | {DOC_DEFAULT}, key=lambda t: t[0])}
     docs = documents_rows_from(used_docs, doc_specs)
@@ -215,9 +350,10 @@ def main():
         "conditions": cond_rows,
         "feats": feat_rows,
         "backgrounds": bg_rows,
+        "spells": spell_rows,
     })
     print(f"races: {len(race_rows)} | conditions: {len(cond_rows)} | feats: {len(feat_rows)}"
-          f" | backgrounds: {len(bg_rows)}")
+          f" | backgrounds: {len(bg_rows)} | spells: {len(spell_rows)}")
     print("documents:", sorted(used_docs))
 
 
