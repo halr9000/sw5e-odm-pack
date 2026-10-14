@@ -551,6 +551,355 @@ def build_items():
     return rows
 
 
+# --- monsters -------------------------------------------------------------
+# NPC-statblock packs, FULL third-party coverage (user decision 2026-10-14).
+# drakes-shipyard/ is excluded: every YAML there is `type: vehicle`, not an
+# NPC statblock. monstertraits/ is a shared trait library (feat/weapon-shaped
+# items), not statblocks; NPC items carry their descriptions inline, so it is
+# not needed for text resolution either.
+MONSTER_PACKS = {  # pack dir -> (document_slug, document title)
+    "monsters":             ("sw5e",                       "SW5e Bestiary"),
+    "snv-monsters":         ("sw5e-snv",                   "Scum and Villainy Monsters"),
+    "fistoscodex":          ("sw5e-fistoscodex",           "Fisto's Codex"),
+    "mandaloriancodexnpcs": ("sw5e-mandaloriancodexnpcs",  "Mandalorian Codex NPCs"),
+    "veshs-galactic-holodex": ("sw5e-veshs-galactic-holodex", "Vesh's Galactic Holodex"),
+}
+MONSTER_DOC_LICENSE = "CC-BY-NC-SA-4.0"
+MONSTER_DOC_AUTHOR = "SW5e community (third-party)"
+
+# Foundry short size codes -> open5e size words.
+MONSTER_SIZES = {"fine": "Fine", "dim": "Diminutive", "tiny": "Tiny",
+                 "sm": "Small", "med": "Medium", "lg": "Large",
+                 "huge": "Huge", "grg": "Gargantuan"}
+
+# Foundry skill keys -> open5e snake_case skill names.
+MONSTER_SKILLS = {
+    "acr": "acrobatics", "ani": "animal_handling", "ath": "athletics",
+    "dec": "deception", "ins": "insight", "itm": "intimidation",
+    "inv": "investigation", "lor": "lore", "med": "medicine",
+    "nat": "nature", "pil": "piloting", "prc": "perception",
+    "prf": "persuasion", "per": "performance", "slt": "sleight_of_hand",
+    "ste": "stealth", "sur": "survival", "tec": "technology",
+}
+MONSTER_ABILITY_KEYS = [("strength", "str"), ("dexterity", "dex"),
+                        ("constitution", "con"), ("intelligence", "int"),
+                        ("wisdom", "wis"), ("charisma", "cha")]
+# Damage/condition immunity keys that differ from their open5e text; anything
+# not listed passes through as-is (lowercased).
+MONSTER_DAMAGE_LABELS = {"kinetic": "kinetic", "energy": "energy",
+                         "ion": "ion", "sonic": "sonic"}
+MONSTER_CONDITION_LABELS = {
+    "diseased": "diseased", "exhaustion": "exhaustion",
+}
+# Foundry ac.calc -> open5e armor_desc.
+MONSTER_AC_DESC = {"natural": "natural armor"}
+
+
+def _cr_value(raw):
+    """'1/2'|0.25|24 -> float. Unparseable -> 0."""
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    s = str(raw or "").strip()
+    if s in ("1/8",):
+        return 0.125
+    if s in ("1/4",):
+        return 0.25
+    if s in ("1/2",):
+        return 0.5
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _cr_text(cr):
+    if cr == int(cr) and cr >= 1:
+        return str(int(cr))
+    return {0.125: "1/8", 0.25: "1/4", 0.5: "1/2"}.get(cr, str(cr))
+
+
+def _prof_bonus(cr):
+    if cr < 1:
+        return 2
+    return 2 + int(cr - 1) // 4
+
+
+def _mod(score):
+    return (score - 10) // 2 if score else -5
+
+
+def _label_list(keys, overrides):
+    out = []
+    for k in keys:
+        k = str(k).strip().lower()
+        if not k:
+            continue
+        out.append(overrides.get(k, k))
+    return out
+
+
+def _joined(trait_key, overrides, custom):
+    parts = _label_list(trait_key, overrides)
+    if custom and custom.strip() not in ("-", "—", "â€”"):
+        parts.append(custom.strip())
+    return ", ".join(parts)
+
+
+def _lang_text(values, custom):
+    """Language key list + custom free-text -> 'Basic, Huttese, <custom>'."""
+    parts = [str(v).strip().title() for v in values if str(v).strip()]
+    if custom and custom.strip() not in ("-", "—", "â€”"):
+        parts.append(custom.strip())
+    return ", ".join(parts)
+
+
+def _mon_action(item):
+    """Foundry NPC item -> open5e action entry {name, desc[, attack_bonus,
+    damage_dice]}, or None for items that don't belong in a statblock."""
+    it_type = item.get("type")
+    if it_type not in ("feat", "weapon"):
+        return None  # spells are summarized by the innate-casting trait;
+                     # equipment/consumables are not statblock entries
+    sy = item.get("system") or {}
+    desc = html_to_md(((sy.get("description") or {}).get("value")) or "")
+    entry = {"name": item.get("name") or "", "desc": desc}
+    if it_type == "weapon":
+        bonus = (sy.get("attack") or {}).get("bonus")
+        try:
+            entry["attack_bonus"] = int(str(bonus).replace("+", ""))
+        except (ValueError, TypeError):
+            pass
+        parts = (sy.get("damage") or {}).get("parts") or []
+        dice = " + ".join(str(p[0]) for p in parts if p and p[0])
+        if dice:
+            entry["damage_dice"] = dice.replace(" + @mod", "")
+    return entry
+
+
+def _mon_bucket(activation_type):
+    """Foundry activation.type -> which open5e array the entry belongs in."""
+    if activation_type == "legendary":
+        return "legendary_actions"
+    if activation_type == "bonus":
+        return "bonus_actions"
+    if activation_type == "reaction":
+        return "reactions"
+    if activation_type in ("action", "minute", "hour", "day", "special"):
+        return "actions"
+    return "special_abilities"  # '', 'none', None -> passive trait
+
+
+def build_monsters():
+    """monsters(slug, name, document_slug, cr, type, data_json)
+
+    FULL coverage of every NPC-statblock pack (MONSTER_PACKS). Port of ODM's
+    statblock shape (scripts/lib/open5e-normalize.mjs normalizeMonster target
+    schema, i.e. the data_json of an actual open5e.sqlite monsters row):
+    open5e key set with actions/bonus_actions/reactions/legendary_actions/
+    special_abilities as JSON arrays of {name, desc}; environments [] and
+    group null (both empty in the source). Handles the two on-disk
+    generations defensively (importer_version 3 core files vs dnd5e 5.2.5
+    regenerated third-party packs): every read is a .get chain, CR may be
+    int/float/str, mandaloriancodexnpcs lacks an `attributes` block entirely
+    (AC/HP/speed default to 0/''), and saves/skills are computed from
+    ability scores + proficiency flags with the proficiency bonus derived
+    from CR (Foundry does not store it for NPCs). document__slug is tagged
+    PER PACK so third-party rows are separable."""
+    files = []   # (pack_dir, relpath, doc_slug)
+    for pack, (doc_slug, _title) in MONSTER_PACKS.items():
+        for f in sorted(glob.glob(os.path.join(SRC_ROOT, pack, "**", "*.yml"),
+                                  recursive=True)):
+            if os.path.basename(f).startswith("_"):
+                continue
+            files.append((pack, f, doc_slug))
+    # slug disambiguation, same pattern as the items pass: basename; if it
+    # collides, prefix the pack tag (cross-pack) or parent folder (within
+    # one pack); a final global seen-set guarantees uniqueness.
+    by_base = {}
+    for pack, f, _ in files:
+        by_base.setdefault(os.path.basename(f)[:-4], []).append(pack)
+    pack_tag = {"snv-monsters": "snv", "fistoscodex": "fisto",
+                "mandaloriancodexnpcs": "mcodex",
+                "veshs-galactic-holodex": "veshs", "monsters": "sw5e"}
+    used_slugs = set()
+    rows = []
+    n_walked = 0
+    n_skipped = 0
+    for pack, f, doc_slug in files:
+        d = _load(f)
+        if d.get("type") != "npc":
+            n_skipped += 1
+            continue
+        n_walked += 1
+        sys_ = d.get("system") or {}
+        det = sys_.get("details") or {}
+        tr = sys_.get("traits") or {}
+        attr = sys_.get("attributes") or {}
+        base_name = os.path.basename(f)[:-4]
+        colliders = by_base.get(base_name, [])
+        parent = os.path.basename(os.path.dirname(f))
+        if len(colliders) > 1 and len(set(colliders)) > 1:
+            slug = f"{pack_tag[pack]}-{base_name}"
+        elif len(colliders) > 1:
+            slug = f"{parent}-{base_name}"
+        else:
+            slug = base_name
+        while slug in used_slugs:
+            slug = f"{slug}-x"
+        used_slugs.add(slug)
+        name = d.get("name") or base_name.replace("-", " ").title()
+        cr = _cr_value(det.get("cr"))
+        pb = _prof_bonus(cr)
+        ctype = det.get("type") or {}
+        type_value = str(ctype.get("value") or
+                         os.path.basename(os.path.dirname(f))).lower()
+        # description: biography (most packs) or description (mandalorian) —
+        # prefer whichever actually carries text
+        bio = det.get("biography") or {}
+        alt = det.get("description") or {}
+        if not (bio.get("value") or "").strip() and alt.get("value"):
+            bio = alt
+        desc = html_to_md(bio.get("value") or "")
+        # abilities + saves
+        ab = sys_.get("abilities") or {}
+        ability_scores, saves = {}, {}
+        for col, key in MONSTER_ABILITY_KEYS:
+            score = ((ab.get(key) or {}).get("value"))
+            score = score if isinstance(score, (int, float)) else 10
+            ability_scores[col] = int(score)
+            prof = (ab.get(key) or {}).get("proficient")
+            saves[col + "_save"] = (_mod(score) + pb * prof
+                                    if prof else None)
+        # skills: bonus = ability mod + pb * proficiency (0 none, 1 prof,
+        # 2 expertise)
+        skills = {}
+        for key, info in (sys_.get("skills") or {}).items():
+            val = info.get("value")
+            if not val:
+                continue
+            abil = info.get("ability") or "wis"
+            score = ability_scores.get(
+                {v: k for k, v in MONSTER_ABILITY_KEYS}.get(abil, "wisdom"), 10)
+            skills[MONSTER_SKILLS.get(key, key)] = _mod(score) + pb * min(val, 2)
+        # AC / HP / speed / senses
+        ac = attr.get("ac") or {}
+        hp = attr.get("hp") or {}
+        speed = {k: int(attr["movement"][k])
+                 for k in ("walk", "fly", "swim", "burrow", "climb")
+                 if isinstance((attr.get("movement") or {}).get(k), (int, float))
+                 and attr["movement"][k] > 0}
+        se = attr.get("senses") or {}
+        sense_bits = [f"{label} {se[k]} ft."
+                      for label, k in (("darkvision", "darkvision"),
+                                       ("blindsight", "blindsight"),
+                                       ("tremorsense", "tremorsense"),
+                                       ("truesight", "truesight"))
+                      if isinstance(se.get(k), (int, float)) and se[k] > 0]
+        if (se.get("special") or "").strip():
+            sense_bits.append(str(se["special"]).strip())
+        perception = skills.get("perception")
+        if perception is None:
+            perception = _mod(ability_scores["wisdom"])
+        sense_bits.append(f"passive Perception {10 + perception}")
+        # items -> action buckets
+        buckets = {"actions": [], "bonus_actions": [], "reactions": [],
+                   "legendary_actions": [], "special_abilities": []}
+        n_spells = 0
+        for item in (d.get("items") or []):
+            if item.get("type") == "spell":
+                n_spells += 1
+                continue
+            entry = _mon_action(item)
+            if entry is None:
+                continue
+            buckets[_mon_bucket(((item.get("system") or {})
+                                 .get("activation") or {}).get("type"))].append(entry)
+        if not any(buckets.values()) and n_spells:
+            # statblock whose only entries are cast powers: fall back to
+            # listing them as actions so the row isn't actionless
+            for item in (d.get("items") or []):
+                if item.get("type") == "spell":
+                    sy = item.get("system") or {}
+                    buckets["actions"].append({
+                        "name": item.get("name") or "",
+                        "desc": html_to_md(
+                            ((sy.get("description") or {}).get("value")) or ""),
+                    })
+        legact = ((sys_.get("resources") or {}).get("legact") or {})
+        legendary_desc = (f"The {name} can take {legact.get('max')} legendary "
+                          f"actions, choosing from the options below. Only one "
+                          f"legendary action can be used at a time and only at "
+                          f"the end of another creature's turn. It regains "
+                          f"spent legendary actions at the start of its turn."
+                          if legact.get("max") else "")
+        data = {
+            "slug": slug,
+            "desc": desc,
+            "name": name,
+            "size": MONSTER_SIZES.get(tr.get("size") or "", "Medium"),
+            "type": type_value,
+            "subtype": ctype.get("subtype") or "",
+            "group": None,
+            "alignment": det.get("alignment") or "",
+            "armor_class": ac.get("flat") or 0,
+            "armor_desc": MONSTER_AC_DESC.get(ac.get("calc") or "", ""),
+            "hit_points": hp.get("value") or 0,
+            "hit_dice": str(hp.get("formula") or ""),
+            "speed": speed,
+            "strength": ability_scores["strength"],
+            "dexterity": ability_scores["dexterity"],
+            "constitution": ability_scores["constitution"],
+            "intelligence": ability_scores["intelligence"],
+            "wisdom": ability_scores["wisdom"],
+            "charisma": ability_scores["charisma"],
+            "strength_save": saves["strength_save"],
+            "dexterity_save": saves["dexterity_save"],
+            "constitution_save": saves["constitution_save"],
+            "intelligence_save": saves["intelligence_save"],
+            "wisdom_save": saves["wisdom_save"],
+            "charisma_save": saves["charisma_save"],
+            "perception": perception,
+            "skills": skills,
+            "damage_vulnerabilities": _joined((tr.get("dv") or {}).get("value", []),
+                                              MONSTER_DAMAGE_LABELS,
+                                              (tr.get("dv") or {}).get("custom", "")),
+            "damage_resistances": _joined((tr.get("dr") or {}).get("value", []),
+                                          MONSTER_DAMAGE_LABELS,
+                                          (tr.get("dr") or {}).get("custom", "")),
+            "damage_immunities": _joined((tr.get("di") or {}).get("value", []),
+                                         MONSTER_DAMAGE_LABELS,
+                                         (tr.get("di") or {}).get("custom", "")),
+            "condition_immunities": _joined((tr.get("ci") or {}).get("value", []),
+                                            MONSTER_CONDITION_LABELS,
+                                            (tr.get("ci") or {}).get("custom", "")),
+            "senses": ", ".join(sense_bits),
+            "languages": _lang_text((tr.get("languages") or {}).get("value", []),
+                                    (tr.get("languages") or {}).get("custom", "")),
+            "challenge_rating": _cr_text(cr),
+            "cr": cr,
+            "actions": buckets["actions"] or None,
+            "bonus_actions": buckets["bonus_actions"] or None,
+            "reactions": buckets["reactions"] or None,
+            "legendary_desc": legendary_desc,
+            "legendary_actions": buckets["legendary_actions"] or None,
+            "special_abilities": buckets["special_abilities"] or None,
+            "spell_list": [],
+            "page_no": 0,
+            "environments": [e.strip() for e in
+                             str(det.get("environment") or "").split(",")
+                             if e.strip()],
+            "img_main": None,
+            "document__slug": doc_slug,
+            "document__title": MONSTER_PACKS[pack][1],
+            "document__license_url": "https://sw5e.com/attributing",
+            "document__url": "https://sw5e.com/",
+        }
+        rows.append((slug, name, doc_slug, cr, type_value, data))
+    print(f"monsters: walked {n_walked} type:npc YAMLs "
+          f"({n_skipped} non-NPC skipped) -> {len(rows)} rows")
+    return rows
+
+
 def main():
     races, race_rows = build_races()
     used_docs = {r["document_slug"] for r in races}
@@ -561,6 +910,7 @@ def main():
     class_rows = build_classes()
     arch_rows = build_archetypes()
     item_rows = build_items()
+    monster_rows = build_monsters()
     used_docs.update(row[2] for row in cond_rows)
     used_docs.update(row[2] for row in feat_rows)
     used_docs.update(row[2] for row in bg_rows)
@@ -568,8 +918,15 @@ def main():
     used_docs.update(row[2] for row in class_rows)
     used_docs.update(row[2] for row in arch_rows)
     used_docs.update(row[2] for row in item_rows)
+    used_docs.update(row[2] for row in monster_rows)
+    monster_doc_specs = {
+        slug: (slug, title, MONSTER_DOC_LICENSE,
+               MONSTER_DOC_AUTHOR if slug != "sw5e" else "SW5e team",
+               "https://sw5e.com/")
+        for slug, title in MONSTER_PACKS.values()}
     doc_specs = {spec[0]: spec for spec in
-                 sorted(set(DOCS.values()) | {DOC_DEFAULT}, key=lambda t: t[0])}
+                 sorted(set(DOCS.values()) | {DOC_DEFAULT}
+                        | set(monster_doc_specs.values()), key=lambda t: t[0])}
     docs = documents_rows_from(used_docs, doc_specs)
     write_pack(OUT, {
         "documents": docs,
@@ -581,11 +938,12 @@ def main():
         "classes": class_rows,
         "archetypes": arch_rows,
         "items": item_rows,
+        "monsters": monster_rows,
     })
     print(f"races: {len(race_rows)} | conditions: {len(cond_rows)} | feats: {len(feat_rows)}"
           f" | backgrounds: {len(bg_rows)} | spells: {len(spell_rows)}"
           f" | classes: {len(class_rows)} | archetypes: {len(arch_rows)}"
-          f" | items: {len(item_rows)}")
+          f" | items: {len(item_rows)} | monsters: {len(monster_rows)}")
     print("documents:", sorted(used_docs))
 
 
